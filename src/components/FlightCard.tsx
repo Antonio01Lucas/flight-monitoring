@@ -4,8 +4,8 @@ import React from "react";
 interface FlightCardProps {
   origem: string;
   destino: string;
-  preco_alvo: number;
-  preco_atual?: number | null;
+  preco_alvo: number | string; // Permitir ambos
+  preco_atual?: number | string | null;
   data_ida: string;
 }
 
