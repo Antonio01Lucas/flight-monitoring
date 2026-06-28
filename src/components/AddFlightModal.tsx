@@ -1,20 +1,16 @@
 "use client";
 import { useState } from "react";
 import { supabase } from "@/lib/supabase";
+import { useRouter } from "next/navigation"; // Importe isso
 
 interface AddFlightModalProps {
-  onFlightAdded: (newFlight: {
-    id: string;
-    origem: string;
-    destino: string;
-    preco_alvo: number;
-    data_ida: string;
-  }) => void;
+  onFlightAdded?: (newFlight: any) => void; // Tornamos opcional
 }
 
 export default function AddFlightModal({ onFlightAdded }: AddFlightModalProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const router = useRouter(); // Inicialize o router
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -35,12 +31,16 @@ export default function AddFlightModal({ onFlightAdded }: AddFlightModalProps) {
       .single();
 
     if (!error) {
-      onFlightAdded(data);
+      if (onFlightAdded) onFlightAdded(data);
       setIsOpen(false);
+      router.refresh(); // <--- O MÁGICO: Isso atualiza o servidor automaticamente!
+    } else {
+      alert("Erro: " + error.message);
     }
     setLoading(false);
   };
 
+  // ... (o restante do seu return permanece igual)
   return (
     <>
       <button
