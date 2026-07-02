@@ -1,16 +1,27 @@
 "use client";
 import { useState } from "react";
-import { supabase } from "@/lib/supabase";
-import { useRouter } from "next/navigation"; // Importe isso
+import { supabase } from "../lib/supabase";
+import { useRouter } from "next/navigation";
+
+interface Flight {
+  id: string;
+  origem: string;
+  destino: string;
+  preco_alvo: number;
+  preco_atual?: number | null;
+  data_ida: string;
+  data_volta?: string | null;
+  created_at?: string;
+}
 
 interface AddFlightModalProps {
-  onFlightAdded?: (newFlight: any) => void; // Tornamos opcional
+  onFlightAdded?: (newFlight: Flight) => void;
 }
 
 export default function AddFlightModal({ onFlightAdded }: AddFlightModalProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const router = useRouter(); // Inicialize o router
+  const router = useRouter();
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -18,29 +29,46 @@ export default function AddFlightModal({ onFlightAdded }: AddFlightModalProps) {
 
     const formData = new FormData(e.currentTarget);
     const flightData = {
-      origem: formData.get("origem"),
-      destino: formData.get("destino"),
+      origem: formData.get("origem") as string,
+      destino: formData.get("destino") as string,
       preco_alvo: parseFloat(formData.get("preco_alvo") as string),
-      data_ida: formData.get("data_ida"),
+      data_ida: formData.get("data_ida") as string,
     };
 
-    const { data, error } = await supabase
+    // 1. Inserir o Voo na tabela 'flights'
+    const { data: flight, error: flightError } = await supabase
       .from("flights")
       .insert([flightData])
       .select()
       .single();
 
-    if (!error) {
-      if (onFlightAdded) onFlightAdded(data);
-      setIsOpen(false);
-      router.refresh(); // <--- O MÁGICO: Isso atualiza o servidor automaticamente!
-    } else {
-      alert("Erro: " + error.message);
+    if (flightError) {
+      alert("Erro ao salvar voo: " + flightError.message);
+      setLoading(false);
+      return;
     }
+
+    // 2. Disparar o Job de monitoramento na tabela 'flight_jobs'
+    const { error: jobError } = await supabase.from("flight_jobs").insert([
+      {
+        origem: flight.origem,
+        destino: flight.destino,
+        data_ida: flight.data_ida,
+        status: "pendente", // O worker irá processar esse status [cite: 100, 114]
+      },
+    ]);
+
+    if (jobError) {
+      console.error("Erro ao criar job de monitoramento:", jobError);
+      // Notificamos, mas o voo já foi salvo com sucesso
+    }
+
+    if (onFlightAdded) onFlightAdded(flight);
+    setIsOpen(false);
+    router.refresh(); // Atualiza a UI do servidor [cite: 135]
     setLoading(false);
   };
 
-  // ... (o restante do seu return permanece igual)
   return (
     <>
       <button
