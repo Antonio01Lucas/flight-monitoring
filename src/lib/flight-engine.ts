@@ -1,37 +1,69 @@
-// src/lib/flight-engine.ts
-// Usaremos uma biblioteca como o 'nodriver' ou 'playwright-stealth'
+import { supabase } from "./supabase";
 
-export async function buscarMelhorPreco(
-  origem: string,
-  destino: string,
-  data: string,
-) {
-  try {
-    console.log(`Iniciando busca robusta para ${origem} -> ${destino}`);
-
-    // 1. Iniciar browser com fingerprinting ativado
-    // 2. Aplicar proxy rotativo
-    // 3. Simular navegação e extrair os dados da tabela da companhia
-
-    const resultados = await rodarScraperProtegido(origem, destino, data);
-
-    return {
-      fonte: "scraper-robusto",
-      dados: resultados,
-      timestamp: new Date().toISOString(),
-    };
-  } catch (error) {
-    console.error("Falha na execução do scraper:", error);
-    throw new Error("Não foi possível extrair dados da companhia aérea.");
-  }
+interface SearchFlightParams {
+  origem: string;
+  destino: string;
+  dataIda: string;
 }
 
-async function rodarScraperProtegido(
-  origem: string,
-  destino: string,
-  data: string,
-) {
-  // Aqui entra a lógica de automação com camuflagem
-  // ex: browser.goto(`https://site-da-cia.com/busca?o=${origem}&d=${destino}&date=${data}`)
-  return [];
+/**
+ * Engine Central de Despacho: Decide inteligentemente se utiliza um preço
+ * recente salvo no banco de dados (Cache) ou se acorda o Scraper criando um Job.
+ */
+export async function dispatchFlightSearch({
+  origem,
+  destino,
+  dataIda,
+}: SearchFlightParams) {
+  const origemUpper = origem.toUpperCase();
+  const destinoUpper = destino.toUpperCase();
+
+  try {
+    // 1. REGRA DE CACHE: Busca se esse voo já foi atualizado recentemente (ex: nas últimas 2 horas)
+    const { data: existingFlight } = await supabase
+      .from("flights")
+      .select("updated_at, preco_atual")
+      .eq("origem", origemUpper)
+      .eq("destino", destinoUpper)
+      .maybeSingle(); // Usamos maybeSingle para evitar erros se a rota for inédita
+
+    if (existingFlight && existingFlight.updated_at) {
+      const diffInHours =
+        (new Date().getTime() - new Date(existingFlight.updated_at).getTime()) /
+        (1000 * 60 * 60);
+
+      // Se foi atualizado há menos de 2 horas, reaproveita o preço para poupar o robô
+      if (diffInHours < 2 && existingFlight.preco_atual) {
+        console.log(
+          `[Engine] Preço recente encontrado para ${origemUpper} -> ${destinoUpper}. Usando Cache.`,
+        );
+        return { status: "cached", preco: existingFlight.preco_atual };
+      }
+    }
+
+    // 2. DISPARO DE TAREFA: Se o preço for antigo ou inexistente, joga na fila de Jobs para o Worker rodar
+    console.log(
+      `[Engine] Preço inexistente ou expirado. Criando Job para ${origemUpper} -> ${destinoUpper}...`,
+    );
+
+    const { data: newJob, error: jobError } = await supabase
+      .from("flight_jobs")
+      .insert([
+        {
+          origem: origemUpper,
+          destino: destinoUpper,
+          data_ida: dataIda,
+          status: "pendente",
+        },
+      ])
+      .select()
+      .single();
+
+    if (jobError) throw jobError;
+
+    return { status: "queued", jobId: newJob.id };
+  } catch (error) {
+    console.error("[Engine] Erro crítico no fluxo de despacho de voos:", error);
+    throw error;
+  }
 }
