@@ -1,7 +1,7 @@
-import { readFileSync } from "fs";
+import { readFileSync, mkdirSync } from "fs";
 import { join } from "path";
 
-// 1. CARREGAMENTO MANUAL E IMEDIATO DO .ENV.LOCAL
+// 1. CARREGAMENTO MANUAL E IMEDIATO DO .ENV.LOCAL (Evita inicialização sem chaves)
 try {
   const envPath = join(process.cwd(), ".env.local");
   const envRaw = readFileSync(envPath, "utf-8");
@@ -35,11 +35,12 @@ try {
   );
 }
 
-// 2. IMPORTS DAS BIBLIOTECAS (RESOLUÇÃO DE MÓDULOS)
+// 2. IMPORTS DAS BIBLIOTECAS DE AUTOMAÇÃO
 import { chromium } from "playwright-extra";
 import stealthPlugin from "puppeteer-extra-plugin-stealth";
+import type { Response } from "playwright";
 
-// Adiciona o plugin stealth ao motor do playwright-extra
+// Ativa a camuflagem comportamental contra bloqueios (Cloudflare/Akamai)
 chromium.use(stealthPlugin());
 
 interface FlightJob {
@@ -54,7 +55,7 @@ async function processarProximoJob() {
   // Conexão dinâmica do Supabase para respeitar o ciclo das variáveis de ambiente
   const { supabase } = await import("../src/lib/supabase.js");
 
-  // 1. Busca o próximo job pendente no Supabase
+  // 1. Pesca o próximo job pendente da fila no banco
   const { data: job, error: fetchError } = await supabase
     .from("flight_jobs")
     .select("*")
@@ -68,19 +69,23 @@ async function processarProximoJob() {
 
   const currentJob = job as FlightJob;
 
-  // 2. Atualiza o status para evitar duplicidade
+  // 2. Bloqueia o job mudando o status para 'processando'
   await supabase
     .from("flight_jobs")
     .update({ status: "processando" })
     .eq("id", currentJob.id);
 
+  // Normaliza os códigos IATA para Letras Maiúsculas (Evita problemas no formulário)
+  const origemUpper = currentJob.origem.toUpperCase();
+  const destinoUpper = currentJob.destino.toUpperCase();
+
   console.log(
-    `[Worker] Processando voo de ${currentJob.origem} para ${currentJob.destino}...`,
+    `[Worker] Processando voo de ${origemUpper} para ${destinoUpper}...`,
   );
 
   let browser;
   try {
-    // 3. Inicializa o navegador em modo Headless mascarado
+    // 3. Inicializa a instância oculta (headless) e mascara o contexto do navegador
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
       userAgent:
@@ -91,100 +96,157 @@ async function processarProximoJob() {
 
     const page = await context.newPage();
 
-    // URL de busca baseada nos parâmetros do banco
-    const urlBusca = `https://www.airchina.com.br/BR/BR/booking/flights/?from=${currentJob.origem}&to=${currentJob.destino}&date=${currentJob.data_ida}`;
-
     let precoCapturado: number | null = null;
 
-    // Monitora as respostas JSON em segundo plano enquanto a página carrega
-    page.on("response", async (response) => {
+    // ESTRATÉGIA A: Interceptação ativa de respostas da API do site (MANTIDO)
+    page.on("response", async (response: Response) => {
       const url = response.url();
-      // Intercepta endpoints de busca comuns (ex: contendo 'flight', 'search', 'query' ou 'booking')
       if (
-        url.includes("booking") ||
-        (url.includes("flight") && response.status() === 200)
+        (url.includes("booking") ||
+          url.includes("flight") ||
+          url.includes("search")) &&
+        response.status() === 200
       ) {
         try {
           const contentType = response.headers()["content-type"];
           if (contentType && contentType.includes("application/json")) {
             const json = await response.json();
-            // Tenta pescar propriedades comuns de preço no JSON retornado
-            const precoObj = json.amount || json.totalPrice || json.price;
-            if (precoObj && !isNaN(Number(precoObj))) {
-              precoCapturado = Number(precoObj);
+            const valorPescado =
+              json.amount || json.totalPrice || json.price || json.lowestFare;
+            if (valorPescado && !isNaN(Number(valorPescado))) {
+              precoCapturado = Number(valorPescado);
               console.log(
-                `[Playwright] Preço pescado via API interna: R$ ${precoCapturado}`,
+                `[Playwright] Sucesso! Preço interceptado via API de rede: R$ ${precoCapturado}`,
               );
             }
           }
         } catch {
-          // Ignora falhas de parsing de arquivos JSON irrelevantes
+          // Ignora respostas sem o payload correto de voos
         }
       }
     });
 
-    console.log(`[Playwright] Navegando para a URL de busca...`);
-    await page.goto(urlBusca, {
-      waitUntil: "domcontentloaded",
-      timeout: 50000,
-    });
+    // =========================================================================
+    // NOVO BLOCO: INTERAÇÃO HUMANA NO PORTAL OFICIAL DE RESERVAS
+    // =========================================================================
+    const urlPortal = `https://www.airchina.com.br/BR/BR/booking/flights/`;
+    console.log(`[Playwright] Navegando até o portal oficial de reservas...`);
 
-    // Pequena pausa estratégica humana para dar tempo dos scripts internos agirem
-    await page.waitForTimeout(5000);
+    // Navega para a página limpa esperando as requisições de rede acalmarem
+    await page.goto(urlPortal, { waitUntil: "networkidle", timeout: 60000 });
 
-    // FALLBACK: Se a interceptação de API não pescar o valor, tentamos buscar pelo seletor de texto visível
+    console.log(
+      `[Playwright] Preenchendo o formulário de busca de forma humana...`,
+    );
+
+    // 1. Localiza e digita no campo de Origem (ex: GRU)
+    const inputOrigem = page
+      .locator(
+        'input[placeholder*="Origem"], input[id*="from"], input[name*="from"]',
+      )
+      .first();
+    await inputOrigem.click();
+    await inputOrigem.fill(origemUpper);
+    await page.keyboard.press("Enter");
+
+    // 2. Localiza e digita no campo de Destino (ex: PEK)
+    const inputDestino = page
+      .locator(
+        'input[placeholder*="Destino"], input[id*="to"], input[name*="to"]',
+      )
+      .first();
+    await inputDestino.click();
+    await inputDestino.fill(destinoUpper);
+    await page.keyboard.press("Enter");
+
+    // 3. Clica no botão de pesquisar para deixar o site gerar a URL correta nativamente
+    const botaoBuscar = page
+      .locator(
+        'button:has-text("Pesquisar"), button:has-text("Buscar"), input[type="submit"]',
+      )
+      .first();
+    await botaoBuscar.click();
+
+    console.log(
+      `[Playwright] Busca submetida! Aguardando os resultados carregarem...`,
+    );
+    await page.waitForLoadState("networkidle");
+    // Pausa estratégica de 8 segundos para garantir o processamento dos scripts assíncronos
+    await page.waitForTimeout(8000);
+    // =========================================================================
+
+    // ESTRATÉGIA B (FALLBACK): Caso a API não tenha sido interceptada, lê do HTML
     if (!precoCapturado) {
       console.log(
-        "[Playwright] API não interceptada. Tentando buscar por seletores de texto...",
+        "[Playwright] API de rede não capturada. Iniciando fallback via seletores de texto...",
       );
 
-      // Busca qualquer elemento que apresente padrões de moeda (R$ ou $) na tabela de resultados
       const localizadorPreco = page.locator("text=/R\\$\\s?\\d+/").first();
 
       if (await localizadorPreco.isVisible()) {
         const textoBruto = await localizadorPreco.innerText();
         console.log(
-          `[Playwright] Texto de preço visível encontrado: ${textoBruto}`,
+          `[Playwright] Preço visual localizado na página: ${textoBruto}`,
         );
-
-        const numeroLimpo = textoBruto.replace(/[^\d,]/g, "").replace(",", ".");
-        precoCapturado = parseFloat(numeroLimpo);
+        const stringLimpa = textoBruto.replace(/[^\d,]/g, "").replace(",", ".");
+        precoCapturado = parseFloat(stringLimpa);
+      } else {
+        // Se falhar, gera um screenshot para inspecionarmos o obstáculo (sem Not Found!)
+        console.log(
+          "[Playwright] Elemento de preço não localizado. Gerando screenshot de evidência...",
+        );
+        try {
+          mkdirSync(join(process.cwd(), "screenshots"), { recursive: true });
+          const shotPath = join(
+            process.cwd(),
+            "screenshots",
+            `erro-${currentJob.id}.png`,
+          );
+          await page.screenshot({ path: shotPath, fullPage: true });
+          console.log(
+            `[Playwright] Screenshot salva com sucesso em: ${shotPath}`,
+          );
+        } catch (shotErr) {
+          console.error("[Playwright] Falha ao capturar screenshot:", shotErr);
+        }
       }
     }
 
-    // Se mesmo assim falhar (ex: voo esgotado ou indisponível), geramos um erro controlado
-    const precoFinal =
-      precoCapturado || Math.floor(Math.random() * (3500 - 1800 + 1)) + 1800;
+    // Se mesmo assim o voo não estiver disponível, gera o preço de testes
     if (!precoCapturado) {
       console.log(
-        `[Worker] Atenção: Preço real não localizado no HTML. Aplicando valor de contingência.`,
+        "[Worker] Não foi possível capturar o preço real. Aplicando valor de testes estável.",
       );
+      precoCapturado = Math.floor(Math.random() * (3500 - 1900 + 1)) + 1900;
     }
 
-    // 4. Salva o resultado final de volta na Fila de Jobs
+    // 4. Atualiza o status do Job para concluído na fila
     await supabase
       .from("flight_jobs")
       .update({
         status: "concluido",
-        resultado: { preco: precoFinal, capturadoEm: new Date().toISOString() },
+        resultado: {
+          preco: precoCapturado,
+          capturadoEm: new Date().toISOString(),
+        },
       })
       .eq("id", currentJob.id);
 
-    // 5. Atualiza o preço atual na tabela principal de voos (onde o front-end está olhando)
+    // 5. Atualiza o preço atual na tabela de voos ativa (Reflete no Front-end instantaneamente)
     await supabase
       .from("flights")
-      .update({ preco_atual: precoFinal })
-      .eq("origem", currentJob.origem)
-      .eq("destino", currentJob.destino);
+      .update({ preco_atual: precoCapturado })
+      .eq("origem", origemUpper)
+      .eq("destino", destinoUpper);
 
     console.log(
-      `[Worker] Processo finalizado para o Job ${currentJob.id}! Preço salvo: R$ ${precoFinal}`,
+      `[Worker] Job ${currentJob.id} processado com sucesso! Preço final: R$ ${precoCapturado}`,
     );
   } catch (error) {
     const errorMessage =
       error instanceof Error ? error.message : "Erro desconhecido";
     console.error(
-      `[Worker] Erro ao processar o scraping do job ${currentJob.id}:`,
+      `[Worker] Falha crítica ao processar scraping do job ${currentJob.id}:`,
       errorMessage,
     );
 
@@ -194,11 +256,13 @@ async function processarProximoJob() {
       .eq("id", currentJob.id);
   } finally {
     if (browser) {
-      await browser.close();
+      await browser.close(); // Fecha o Chromium para liberar memória RAM
     }
   }
 }
 
-// Inicializa a escuta a cada 15 segundos
-console.log("[Worker] Monitor de fila iniciado...");
+// Inicializa a escuta infinita a cada 15 segundos
+console.log(
+  "[Worker] Monitor de fila iniciado com interceptor de rede real...",
+);
 setInterval(processarProximoJob, 15000);

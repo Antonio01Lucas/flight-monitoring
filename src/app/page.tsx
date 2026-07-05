@@ -64,10 +64,19 @@ export default function Page() {
           schema: "public",
           table: "flight_jobs",
         },
-        async (payload) => {
+        (payload) => {
           console.log("Fila de Jobs atualizada no banco!", payload);
-          await fetchFlights();
-          router.refresh();
+
+          // ISOLAMENTO RESILIENTE: Executa a busca em uma microtarefa separada
+          // contornando o fechamento precoce de canais de mensagens do navegador
+          setTimeout(async () => {
+            try {
+              await fetchFlights();
+              router.refresh();
+            } catch (err) {
+              console.error("Erro reativo ao atualizar listagem de voos:", err);
+            }
+          }, 50);
         },
       )
       .subscribe();
