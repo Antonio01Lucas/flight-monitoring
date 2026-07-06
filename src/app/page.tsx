@@ -2,8 +2,8 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { supabase } from "../lib/supabase";
-import AddFlightModal from "../components/AddFlightModal";
 
 interface Flight {
   id: string;
@@ -133,12 +133,12 @@ export default function Page() {
     <main className="min-h-screen bg-slate-900 text-slate-100 p-8 space-y-6">
       <div className="flex justify-between items-center">
         <h1 className="text-2xl font-bold">Monitoramento de Voos</h1>
-        <AddFlightModal
-          onFlightAdded={() => {
-            fetchFlights();
-            router.refresh();
-          }}
-        />
+        <Link
+          href="/flights/new"
+          className="bg-blue-600 hover:bg-blue-500 text-white font-medium px-4 py-2 rounded-lg transition-colors text-sm shadow-md"
+        >
+          Adicionar Rota
+        </Link>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">

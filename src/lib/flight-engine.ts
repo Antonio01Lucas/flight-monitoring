@@ -1,69 +1,127 @@
 import { supabase } from "./supabase";
 
-interface SearchFlightParams {
+interface DispatchParams {
   origem: string;
   destino: string;
   dataIda: string;
+  flightId: string; // ID do card criado na tabela public.flights
+  origemSkyId?: string;
+  origemEntityId?: string;
+  destinoSkyId?: string;
+  destinoEntityId?: string;
+}
+
+interface EngineResult {
+  status: "cached" | "queued";
+  preco: number | null;
+  jobId?: string;
 }
 
 /**
- * Engine Central de Despacho: Decide inteligentemente se utiliza um preço
- * recente salvo no banco de dados (Cache) ou se acorda o Scraper criando um Job.
+ * Motor Central de Despacho de Buscas de Voos
+ * Coordena a leitura de cache e criação de jobs em fila para o Scraper Worker
  */
 export async function dispatchFlightSearch({
   origem,
   destino,
   dataIda,
-}: SearchFlightParams) {
-  const origemUpper = origem.toUpperCase();
-  const destinoUpper = destino.toUpperCase();
+  flightId,
+  origemSkyId,
+  origemEntityId,
+  destinoSkyId,
+  destinoEntityId,
+}: DispatchParams): Promise<EngineResult> {
+  const oUpper = origem.toUpperCase();
+  const dUpper = destino.toUpperCase();
+
+  console.log(
+    `[Flight Engine] Processando requisição de busca para ${oUpper} ✈ ${dUpper} na data ${dataIda}`,
+  );
 
   try {
-    // 1. REGRA DE CACHE: Busca se esse voo já foi atualizado recentemente (ex: nas últimas 2 horas)
-    const { data: existingFlight } = await supabase
-      .from("flights")
-      .select("updated_at, preco_atual")
-      .eq("origem", origemUpper)
-      .eq("destino", destinoUpper)
-      .maybeSingle(); // Usamos maybeSingle para evitar erros se a rota for inédita
+    // 1. ESTRATÉGIA DE CACHE: Procura se algum outro job idêntico já coletou preços nas últimas 2 horas
+    const duasHorasAtras = new Date(
+      Date.now() - 2 * 60 * 60 * 1000,
+    ).toISOString();
 
-    if (existingFlight && existingFlight.updated_at) {
-      const diffInHours =
-        (new Date().getTime() - new Date(existingFlight.updated_at).getTime()) /
-        (1000 * 60 * 60);
+    const { data: cachedJob, error: cacheError } = await supabase
+      .from("flight_jobs")
+      .select("resultado")
+      .eq("origem", oUpper)
+      .eq("destino", dUpper)
+      .eq("data_ida", dataIda)
+      .eq("status", "concluido")
+      .gt("created_at", duasHorasAtras)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-      // Se foi atualizado há menos de 2 horas, reaproveita o preço para poupar o robô
-      if (diffInHours < 2 && existingFlight.preco_atual) {
+    if (!cacheError && cachedJob && cachedJob.resultado) {
+      const resultadoJson = cachedJob.resultado as { preco?: number };
+      if (resultadoJson.preco) {
         console.log(
-          `[Engine] Preço recente encontrado para ${origemUpper} -> ${destinoUpper}. Usando Cache.`,
+          `[Flight Engine] 🎯 Cache válido localizado! Tarifa poupada: R$ ${resultadoJson.preco}`,
         );
-        return { status: "cached", preco: existingFlight.preco_atual };
+
+        // Sincroniza imediatamente o card principal com o valor do cache
+        await supabase
+          .from("flights")
+          .update({ preco_atual: resultadoJson.preco })
+          .eq("id", flightId);
+
+        return {
+          status: "cached",
+          preco: resultadoJson.preco,
+        };
       }
     }
 
-    // 2. DISPARO DE TAREFA: Se o preço for antigo ou inexistente, joga na fila de Jobs para o Worker rodar
+    // 2. FILA DE EXECUÇÃO: Se não há cache válido, cria o Job ligando as pontas das tabelas
     console.log(
-      `[Engine] Preço inexistente ou expirado. Criando Job para ${origemUpper} -> ${destinoUpper}...`,
+      `[Flight Engine] ⏳ Sem cache recente. Injetando novo Job Pendente na fila...`,
     );
 
     const { data: newJob, error: jobError } = await supabase
       .from("flight_jobs")
       .insert([
         {
-          origem: origemUpper,
-          destino: destinoUpper,
+          flight_id: flightId, // Injeta o relacionamento UUID oficial para o Worker não dar undefined
+          origem: oUpper,
+          destino: dUpper,
           data_ida: dataIda,
           status: "pendente",
+          // Metadados colhidos reativamente na caixa de predição do modal
+          origem_sky_id: origemSkyId || `${oUpper}-sky`,
+          origem_entity_id: origemEntityId || null,
+          destino_sky_id: destinoSkyId || `${dUpper}-sky`,
+          destino_entity_id: destinoEntityId || null,
         },
       ])
       .select()
       .single();
 
-    if (jobError) throw jobError;
+    if (jobError) {
+      console.error(
+        `[Flight Engine] ❌ Falha crítica ao inserir na tabela flight_jobs:`,
+        jobError.message,
+      );
+      throw new Error(jobError.message);
+    }
 
-    return { status: "queued", jobId: newJob.id };
+    console.log(
+      `[Flight Engine] 🚀 Job criado com sucesso absoluto na tabela! ID: ${newJob.id}`,
+    );
+
+    return {
+      status: "queued",
+      preco: null,
+      jobId: newJob.id,
+    };
   } catch (error) {
-    console.error("[Engine] Erro crítico no fluxo de despacho de voos:", error);
+    console.error(
+      `[Flight Engine] Erro fatal no fluxo da Engine central:`,
+      error,
+    );
     throw error;
   }
 }

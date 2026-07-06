@@ -1,61 +1,119 @@
-import { readFileSync, mkdirSync } from "fs";
+import { readFileSync } from "fs";
 import { join } from "path";
 
-// 1. CARREGAMENTO MANUAL E IMEDIATO DO .ENV.LOCAL (Evita inicialização sem chaves)
+// 1. CARREGAMENTO MANUAL E IMEDIATO DO .ENV.LOCAL
 try {
   const envPath = join(process.cwd(), ".env.local");
   const envRaw = readFileSync(envPath, "utf-8");
-
   envRaw.split("\n").forEach((line) => {
     const trimmedLine = line.trim();
     if (!trimmedLine || trimmedLine.startsWith("#")) return;
-
     const firstEq = trimmedLine.indexOf("=");
     if (firstEq === -1) return;
-
     const key = trimmedLine.substring(0, firstEq).trim();
     let value = trimmedLine.substring(firstEq + 1).trim();
-
     if (
       (value.startsWith('"') && value.endsWith('"')) ||
       (value.startsWith("'") && value.endsWith("'"))
     ) {
       value = value.substring(1, value.length - 1);
     }
-
     process.env[key] = value;
   });
-  console.log(
-    "[Worker] Variáveis de ambiente do .env.local carregadas com sucesso!",
-  );
 } catch (error) {
   console.error(
-    "[Worker] Erro crítico ao ler o arquivo .env.local manual:",
+    "[Orquestrador] Erro crítico ao ler o arquivo .env.local manual:",
     error,
   );
 }
 
-// 2. IMPORTS DAS BIBLIOTECAS DE AUTOMAÇÃO
 import { chromium } from "playwright-extra";
 import stealthPlugin from "puppeteer-extra-plugin-stealth";
 import type { Response } from "playwright";
 
-// Ativa a camuflagem comportamental contra bloqueios (Cloudflare/Akamai)
+// Importação das estratégias modulares de scraping e API
+import { scrapeAirChina } from "../src/lib/scrapers/airchina";
+import { scrapeLatam } from "../src/lib/scrapers/latam";
+import { scrapeGol } from "../src/lib/scrapers/gol";
+import { scrapeAzul } from "../src/lib/scrapers/azul";
+import { buscarPrecoOficial } from "../src/lib/SkyScrapper";
+
 chromium.use(stealthPlugin());
 
 interface FlightJob {
   id: string;
+  flight_id: string;
   origem: string;
   destino: string;
   data_ida: string;
   status: "pendente" | "processando" | "concluido" | "erro";
+  origem_sky_id?: string;
+  origem_entity_id?: string;
+  destino_sky_id?: string;
+  destino_entity_id?: string;
+}
+
+const AEROPORTOS_BR = [
+  "GRU",
+  "CGH",
+  "GIG",
+  "SDU",
+  "BSB",
+  "VCP",
+  "CNF",
+  "CWB",
+  "POA",
+  "REC",
+  "SSA",
+  "FOR",
+  "GYN",
+  "NVT",
+  "FLN",
+];
+
+async function extrairPrecoDeResponse(
+  response: Response,
+): Promise<number | null> {
+  try {
+    const url = response.url();
+    if (
+      url.includes("flight-offers") ||
+      url.includes("air-offers") ||
+      url.includes("b2c-flights") ||
+      url.includes("flight-search") ||
+      url.includes("api/v1/search") ||
+      url.includes("voeazul") ||
+      url.includes("booking/flights")
+    ) {
+      if (response.status() === 200) {
+        const contentType = response.headers()["content-type"];
+        if (contentType && contentType.includes("application/json")) {
+          const json = await response.json();
+          const oferta =
+            json.offers?.[0] ||
+            json.bundleOffers?.[0] ||
+            json.flights?.[0] ||
+            json.vendaDireta?.[0];
+          const valor =
+            oferta?.price?.total?.amount ||
+            oferta?.amount ||
+            json.amount ||
+            json.totalPrice ||
+            oferta?.precoMinimo;
+
+          if (valor && !isNaN(Number(valor))) {
+            return Number(valor);
+          }
+        }
+      }
+    }
+  } catch {}
+  return null;
 }
 
 async function processarProximoJob() {
-  // Conexão dinâmica do Supabase para respeitar o ciclo das variáveis de ambiente
   const { supabase } = await import("../src/lib/supabase.js");
 
-  // 1. Pesca o próximo job pendente da fila no banco
   const { data: job, error: fetchError } = await supabase
     .from("flight_jobs")
     .select("*")
@@ -63,206 +121,237 @@ async function processarProximoJob() {
     .limit(1)
     .single();
 
-  if (fetchError || !job) {
-    return; // Sem tarefas na fila
-  }
+  if (fetchError || !job) return;
 
   const currentJob = job as FlightJob;
 
-  // 2. Bloqueia o job mudando o status para 'processando'
   await supabase
     .from("flight_jobs")
     .update({ status: "processando" })
     .eq("id", currentJob.id);
 
-  // Normaliza os códigos IATA para Letras Maiúsculas (Evita problemas no formulário)
   const origemUpper = currentJob.origem.toUpperCase();
   const destinoUpper = currentJob.destino.toUpperCase();
 
   console.log(
-    `[Worker] Processando voo de ${origemUpper} para ${destinoUpper}...`,
+    `\n[Orquestrador] 🚀 Processando Job ${currentJob.id}: ${origemUpper} ✈ ${destinoUpper}`,
   );
 
-  let browser;
   try {
-    // 3. Inicializa a instância oculta (headless) e mascara o contexto do navegador
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 720 },
-      locale: "pt-BR",
-    });
-
-    const page = await context.newPage();
-
+    const precosEncontrados: number[] = [];
     let precoCapturado: number | null = null;
 
-    // ESTRATÉGIA A: Interceptação ativa de respostas da API do site (MANTIDO)
-    page.on("response", async (response: Response) => {
-      const url = response.url();
-      if (
-        (url.includes("booking") ||
-          url.includes("flight") ||
-          url.includes("search")) &&
-        response.status() === 200
-      ) {
-        try {
-          const contentType = response.headers()["content-type"];
-          if (contentType && contentType.includes("application/json")) {
-            const json = await response.json();
-            const valorPescado =
-              json.amount || json.totalPrice || json.price || json.lowestFare;
-            if (valorPescado && !isNaN(Number(valorPescado))) {
-              precoCapturado = Number(valorPescado);
-              console.log(
-                `[Playwright] Sucesso! Preço interceptado via API de rede: R$ ${precoCapturado}`,
-              );
-            }
+    if (
+      AEROPORTOS_BR.includes(origemUpper) &&
+      AEROPORTOS_BR.includes(destinoUpper)
+    ) {
+      console.log(
+        `[Orquestrador] 🏎️ Rota Doméstica: Disparando 4 motores em paralelo...`,
+      );
+
+      const tarefas = [
+        // LATAM
+        (async () => {
+          let precoLocal: number | null = null;
+          const browserLatam = await chromium.launch({ headless: true });
+          const ctx = await browserLatam.newContext({
+            userAgent:
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale: "pt-BR",
+          });
+          ctx.on("response", async (res: Response) => {
+            const p = await extrairPrecoDeResponse(res);
+            if (p) precoLocal = p;
+          });
+          const page = await ctx.newPage();
+          try {
+            const domPreco = await scrapeLatam({
+              page,
+              origem: origemUpper,
+              destino: destinoUpper,
+              dataIda: currentJob.data_ida,
+            });
+            if (domPreco) precoLocal = domPreco;
+          } catch (err) {
+            console.error(`[Orquestrador ❌ Falha LATAM]:`, err);
+          } finally {
+            await browserLatam.close();
           }
-        } catch {
-          // Ignora respostas sem o payload correto de voos
-        }
-      }
-    });
+          return { cia: "LATAM", preco: precoLocal };
+        })(),
 
-    // =========================================================================
-    // NOVO BLOCO: INTERAÇÃO HUMANA NO PORTAL OFICIAL DE RESERVAS
-    // =========================================================================
-    const urlPortal = `https://www.airchina.com.br/BR/BR/booking/flights/`;
-    console.log(`[Playwright] Navegando até o portal oficial de reservas...`);
+        // GOL
+        (async () => {
+          let precoLocal: number | null = null;
+          const browserGol = await chromium.launch({ headless: true });
+          const ctx = await browserGol.newContext({
+            userAgent:
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale: "pt-BR",
+          });
+          ctx.on("response", async (res: Response) => {
+            const p = await extrairPrecoDeResponse(res);
+            if (p) precoLocal = p;
+          });
+          const page = await ctx.newPage();
+          try {
+            const domPreco = await scrapeGol({
+              page,
+              origem: origemUpper,
+              destino: destinoUpper,
+              dataIda: currentJob.data_ida,
+            });
+            if (domPreco) precoLocal = domPreco;
+          } catch (err) {
+            console.error(`[Orquestrador ❌ Falha GOL]:`, err);
+          } finally {
+            await browserGol.close();
+          }
+          return { cia: "GOL", preco: precoLocal };
+        })(),
 
-    // Navega para a página limpa esperando as requisições de rede acalmarem
-    await page.goto(urlPortal, { waitUntil: "networkidle", timeout: 60000 });
+        // AZUL
+        (async () => {
+          let precoLocal: number | null = null;
+          const browserAzul = await chromium.launch({ headless: true });
+          const ctx = await browserAzul.newContext({
+            userAgent:
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale: "pt-BR",
+          });
+          ctx.on("response", async (res: Response) => {
+            const p = await extrairPrecoDeResponse(res);
+            if (p) precoLocal = p;
+          });
+          const page = await ctx.newPage();
+          try {
+            const domPreco = await scrapeAzul({
+              page,
+              origem: origemUpper,
+              destino: destinoUpper,
+              dataIda: currentJob.data_ida,
+            });
+            if (domPreco) precoLocal = domPreco;
+          } catch (err) {
+            console.error(`[Orquestrador ❌ Falha AZUL]:`, err);
+          } finally {
+            await browserAzul.close();
+          }
+          return { cia: "Azul", preco: precoLocal };
+        })(),
 
-    console.log(
-      `[Playwright] Preenchendo o formulário de busca de forma humana...`,
-    );
+        // API OFICIAL SKY-SCRAPPER V2
+        (async () => {
+          let precoLocal: number | null = null;
+          try {
+            precoLocal = await buscarPrecoOficial({
+              origem: currentJob.origem_sky_id || origemUpper,
+              destino: currentJob.destino_sky_id || destinoUpper,
+              dataIda: currentJob.data_ida,
+              origemEntityId: currentJob.origem_entity_id,
+              destinoEntityId: currentJob.destino_entity_id,
+            });
+          } catch (err) {
+            console.error(`[Orquestrador ❌ Falha API Skyscanner V2]:`, err);
+          }
+          return { cia: "API_Skyscanner", preco: precoLocal };
+        })(),
+      ];
 
-    // 1. Localiza e digita no campo de Origem (ex: GRU)
-    const inputOrigem = page
-      .locator(
-        'input[placeholder*="Origem"], input[id*="from"], input[name*="from"]',
-      )
-      .first();
-    await inputOrigem.click();
-    await inputOrigem.fill(origemUpper);
-    await page.keyboard.press("Enter");
+      const resultados = await Promise.allSettled(tarefas);
 
-    // 2. Localiza e digita no campo de Destino (ex: PEK)
-    const inputDestino = page
-      .locator(
-        'input[placeholder*="Destino"], input[id*="to"], input[name*="to"]',
-      )
-      .first();
-    await inputDestino.click();
-    await inputDestino.fill(destinoUpper);
-    await page.keyboard.press("Enter");
-
-    // 3. Clica no botão de pesquisar para deixar o site gerar a URL correta nativamente
-    const botaoBuscar = page
-      .locator(
-        'button:has-text("Pesquisar"), button:has-text("Buscar"), input[type="submit"]',
-      )
-      .first();
-    await botaoBuscar.click();
-
-    console.log(
-      `[Playwright] Busca submetida! Aguardando os resultados carregarem...`,
-    );
-    await page.waitForLoadState("networkidle");
-    // Pausa estratégica de 8 segundos para garantir o processamento dos scripts assíncronos
-    await page.waitForTimeout(8000);
-    // =========================================================================
-
-    // ESTRATÉGIA B (FALLBACK): Caso a API não tenha sido interceptada, lê do HTML
-    if (!precoCapturado) {
-      console.log(
-        "[Playwright] API de rede não capturada. Iniciando fallback via seletores de texto...",
-      );
-
-      const localizadorPreco = page.locator("text=/R\\$\\s?\\d+/").first();
-
-      if (await localizadorPreco.isVisible()) {
-        const textoBruto = await localizadorPreco.innerText();
-        console.log(
-          `[Playwright] Preço visual localizado na página: ${textoBruto}`,
-        );
-        const stringLimpa = textoBruto.replace(/[^\d,]/g, "").replace(",", ".");
-        precoCapturado = parseFloat(stringLimpa);
-      } else {
-        // Se falhar, gera um screenshot para inspecionarmos o obstáculo (sem Not Found!)
-        console.log(
-          "[Playwright] Elemento de preço não localizado. Gerando screenshot de evidência...",
-        );
-        try {
-          mkdirSync(join(process.cwd(), "screenshots"), { recursive: true });
-          const shotPath = join(
-            process.cwd(),
-            "screenshots",
-            `erro-${currentJob.id}.png`,
-          );
-          await page.screenshot({ path: shotPath, fullPage: true });
+      resultados.forEach((res) => {
+        if (res.status === "fulfilled" && res.value.preco) {
           console.log(
-            `[Playwright] Screenshot salva com sucesso em: ${shotPath}`,
+            `[Comparador] Valor retornado por [${res.value.cia}]: R$ ${res.value.preco}`,
           );
-        } catch (shotErr) {
-          console.error("[Playwright] Falha ao capturar screenshot:", shotErr);
+          precosEncontrados.push(res.value.preco);
         }
+      });
+
+      if (precosEncontrados.length > 0) {
+        precoCapturado = Math.min(...precosEncontrados);
+        console.log(
+          `[Orquestrador] 🏆 Menor tarifa encontrada: R$ ${precoCapturado}`,
+        );
+      }
+    } else {
+      console.log(`[Orquestrador] Rota Internacional. Iniciando Air China...`);
+      const browserInternacional = await chromium.launch({ headless: true });
+      const ctx = await browserInternacional.newContext({ locale: "pt-BR" });
+      const page = await ctx.newPage();
+      try {
+        const resAirChina = await scrapeAirChina({
+          page,
+          origem: origemUpper,
+          destino: destinoUpper,
+          dataIda: currentJob.data_ida,
+        });
+        if (resAirChina) precoCapturado = resAirChina;
+      } finally {
+        await browserInternacional.close();
       }
     }
 
-    // Se mesmo assim o voo não estiver disponível, gera o preço de testes
-    if (!precoCapturado) {
-      console.log(
-        "[Worker] Não foi possível capturar o preço real. Aplicando valor de testes estável.",
-      );
-      precoCapturado = Math.floor(Math.random() * (3500 - 1900 + 1)) + 1900;
+    if (precoCapturado) {
+      await supabase
+        .from("flight_jobs")
+        .update({
+          status: "concluido",
+          resultado: {
+            preco: precoCapturado,
+            capturadoEm: new Date().toISOString(),
+          },
+        })
+        .eq("id", currentJob.id);
+
+      if (currentJob.flight_id) {
+        const { error: updateError } = await supabase
+          .from("flights")
+          .update({ preco_atual: precoCapturado })
+          .eq("id", currentJob.flight_id);
+
+        if (updateError) {
+          console.error(
+            `[Orquestrador] ❌ Erro ao atualizar a tabela flights:`,
+            updateError.message,
+          );
+        } else {
+          console.log(
+            `[Orquestrador] 🎉 Sucesso absoluto! Card [${currentJob.flight_id}] sincronizado com R$ ${precoCapturado}`,
+          );
+        }
+      } else {
+        console.warn(
+          `[Orquestrador] ⚠️ Job processado, mas a coluna flight_id estava vazia neste registro.`,
+        );
+      }
+    } else {
+      await supabase
+        .from("flight_jobs")
+        .update({ status: "erro" })
+        .eq("id", currentJob.id);
+      console.log(`[Orquestrador] X Fim da linha. Nenhuma tarifa localizada.`);
     }
-
-    // 4. Atualiza o status do Job para concluído na fila
-    await supabase
-      .from("flight_jobs")
-      .update({
-        status: "concluido",
-        resultado: {
-          preco: precoCapturado,
-          capturadoEm: new Date().toISOString(),
-        },
-      })
-      .eq("id", currentJob.id);
-
-    // 5. Atualiza o preço atual na tabela de voos ativa (Reflete no Front-end instantaneamente)
-    await supabase
-      .from("flights")
-      .update({ preco_atual: precoCapturado })
-      .eq("origem", origemUpper)
-      .eq("destino", destinoUpper);
-
-    console.log(
-      `[Worker] Job ${currentJob.id} processado com sucesso! Preço final: R$ ${precoCapturado}`,
-    );
   } catch (error) {
-    const errorMessage =
-      error instanceof Error ? error.message : "Erro desconhecido";
-    console.error(
-      `[Worker] Falha crítica ao processar scraping do job ${currentJob.id}:`,
-      errorMessage,
-    );
-
+    console.error(`[Orquestrador] Falha fatal no job ${currentJob.id}:`, error);
     await supabase
       .from("flight_jobs")
       .update({ status: "erro" })
       .eq("id", currentJob.id);
   } finally {
-    if (browser) {
-      await browser.close(); // Fecha o Chromium para liberar memória RAM
-    }
+    console.log(
+      "[Orquestrador] Aguardando 15 segundos antes de checar a fila...",
+    );
+    setTimeout(checarFilaSegura, 15000);
   }
 }
 
-// Inicializa a escuta infinita a cada 15 segundos
+async function checarFilaSegura() {
+  await processarProximoJob();
+}
+
 console.log(
-  "[Worker] Monitor de fila iniciado com interceptor de rede real...",
+  "[Orquestrador] Monitor Híbrido Paralelo Total com SkyScrapper V2 Ligado!",
 );
-setInterval(processarProximoJob, 15000);
+checarFilaSegura();
