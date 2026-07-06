@@ -29,7 +29,7 @@ try {
 
 import { chromium } from "playwright-extra";
 import stealthPlugin from "puppeteer-extra-plugin-stealth";
-import type { Response } from "playwright";
+import type { Response, Page } from "playwright";
 
 // Importação das estratégias modulares de scraping e API
 import { scrapeAirChina } from "../src/lib/scrapers/airchina";
@@ -70,6 +70,73 @@ const AEROPORTOS_BR = [
   "NVT",
   "FLN",
 ];
+
+// Motor de Contingência Autônomo (Google Flights) Altamente Resiliente
+async function scrapeGoogleFlightsFallback(
+  origem: string,
+  destino: string,
+  dataIda: string,
+  page: Page,
+): Promise<number | null> {
+  try {
+    const targetUrl = `https://www.google.com/flights?hl=pt-BR#flt=${origem}.${destino}.${dataIda}`;
+    console.log(`[Robô Backup] 🌐 Consultando Google Flights: ${targetUrl}`);
+
+    // Aguarda a rede estabilizar para dar tempo ao script de hash do Google carregar os dados
+    await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 45000 });
+
+    // Pequena folga garantida para que os cards de melhores voos sejam renderizados na interface
+    await page.waitForTimeout(3000);
+
+    // Seletor dinâmico que foca nos spans de texto contendo preços válidos na moeda local
+    const textPriceSelector = 'span:has-text("R$")';
+    await page.waitForSelector(textPriceSelector, { timeout: 20000 });
+
+    // Captura todos os blocos contendo "R$" presentes nos cards reais de passagens
+    const precosCapturados = await page.evaluate(() => {
+      // Busca em elementos que comumente envelopam preços no Google Flights
+      const elementos = Array.from(
+        document.querySelectorAll('span, div, [data-gs], [role="link"] span'),
+      );
+      const valores: number[] = [];
+
+      elementos.forEach((el) => {
+        const texto = el.textContent || "";
+        if (texto.includes("R$")) {
+          // Extrai puramente os dígitos numéricos (ex: "R$ 1.250" vira 1250)
+          const limpo = texto.replace(/[^\d]/g, "");
+          const num = parseFloat(limpo);
+
+          // Filtra possíveis ruídos de layout (como R$ 0 ou IDs numéricos gigantes de voo)
+          if (!isNaN(num) && num > 150 && num < 60000) {
+            valores.push(num);
+          }
+        }
+      });
+
+      return valores;
+    });
+
+    if (precosCapturados && precosCapturados.length > 0) {
+      // Como o Google Flights ordena por "Melhores Voos (Mais baratos)" no topo, o menor valor capturado é a tarifa oficial
+      const menorPreco = Math.min(...precosCapturados);
+      console.log(
+        `[Robô Backup] 🎯 Tarifa extraída do Google Flights: R$ ${menorPreco}`,
+      );
+      return menorPreco;
+    } else {
+      console.warn(
+        `[Robô Backup] ⚠️ Nenhum padrão monetário "R$" contendo tarifas válidas foi localizado no DOM.`,
+      );
+    }
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : "Erro desconhecido";
+    console.error(
+      `[Robô Backup] ❌ Falha no scraping do Google Flights: ${errorMsg}`,
+    );
+  }
+  return null;
+}
 
 async function extrairPrecoDeResponse(
   response: Response,
@@ -119,7 +186,7 @@ async function processarProximoJob() {
     .select("*")
     .eq("status", "pendente")
     .limit(1)
-    .single();
+    .maybeSingle();
 
   if (fetchError || !job) return;
 
@@ -146,7 +213,7 @@ async function processarProximoJob() {
       AEROPORTOS_BR.includes(destinoUpper)
     ) {
       console.log(
-        `[Orquestrador] 🏎️ Rota Doméstica: Disparando 4 motores em paralelo...`,
+        `[Orquestrador] 🏎️ Rota Doméstica: Disparando motores em paralelo...`,
       );
 
       const tarefas = [
@@ -172,6 +239,15 @@ async function processarProximoJob() {
               dataIda: currentJob.data_ida,
             });
             if (domPreco) precoLocal = domPreco;
+
+            if (!precoLocal) {
+              precoLocal = await scrapeGoogleFlightsFallback(
+                origemUpper,
+                destinoUpper,
+                currentJob.data_ida,
+                page,
+              );
+            }
           } catch (err) {
             console.error(`[Orquestrador ❌ Falha LATAM]:`, err);
           } finally {
@@ -202,6 +278,15 @@ async function processarProximoJob() {
               dataIda: currentJob.data_ida,
             });
             if (domPreco) precoLocal = domPreco;
+
+            if (!precoLocal) {
+              precoLocal = await scrapeGoogleFlightsFallback(
+                origemUpper,
+                destinoUpper,
+                currentJob.data_ida,
+                page,
+              );
+            }
           } catch (err) {
             console.error(`[Orquestrador ❌ Falha GOL]:`, err);
           } finally {
@@ -232,6 +317,15 @@ async function processarProximoJob() {
               dataIda: currentJob.data_ida,
             });
             if (domPreco) precoLocal = domPreco;
+
+            if (!precoLocal) {
+              precoLocal = await scrapeGoogleFlightsFallback(
+                origemUpper,
+                destinoUpper,
+                currentJob.data_ida,
+                page,
+              );
+            }
           } catch (err) {
             console.error(`[Orquestrador ❌ Falha AZUL]:`, err);
           } finally {
@@ -288,6 +382,17 @@ async function processarProximoJob() {
           dataIda: currentJob.data_ida,
         });
         if (resAirChina) precoCapturado = resAirChina;
+
+        if (!precoCapturado) {
+          precoCapturado = await scrapeGoogleFlightsFallback(
+            origemUpper,
+            destinoUpper,
+            currentJob.data_ida,
+            page,
+          );
+        }
+      } catch (Brass) {
+        console.error(`[Orquestrador ❌ Falha Air China / Fallback]:`, Brass);
       } finally {
         await browserInternacional.close();
       }
